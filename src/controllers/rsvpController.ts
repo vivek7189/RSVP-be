@@ -2,10 +2,20 @@ import { Request, Response } from 'express';
 import { validationResult } from 'express-validator';
 import pool from '../config/database';
 import { generateToken, isTokenExpired, verifyToken } from '../utils/jwt';
-import { getCachedRSVPsWithLock, invalidateRSVPCache } from '../utils/cache';
+import { 
+  getCachedPageWithLock, 
+  getCachedCountWithLock,
+  incrementCount,
+  decrementCount,
+  invalidateCount,
+  invalidateFirstPageAllLimits,
+  setUserRSVP,
+  invalidateUserRSVP,
+  syncCountFromDB
+} from '../utils/cache';
 import { sendCancellationEmail } from '../utils/email';
 import { sanitizeName, sanitizeEmail } from '../utils/sanitize';
-import { RSVPPublic } from '../types';
+import { RSVPPublic, PaginatedResponse } from '../types';
 import { AuthRequest } from '../middleware/auth';
 
 export const createRSVP = async (req: Request, res: Response): Promise<void> => {
@@ -39,7 +49,10 @@ export const createRSVP = async (req: Request, res: Response): Promise<void> => 
       [name, email, token, expiresAt]
     );
 
-    await invalidateRSVPCache();
+    await incrementCount();
+    await invalidateCount();
+    await invalidateFirstPageAllLimits();
+    await setUserRSVP(email, result.rows[0]);
 
     sendCancellationEmail(email, name, token)
       .catch(error => {
@@ -62,15 +75,45 @@ export const createRSVP = async (req: Request, res: Response): Promise<void> => 
 
 export const getAllRSVPs = async (req: Request, res: Response): Promise<void> => {
   try {
-    const fetchFromDB = async () => {
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 20));
+    const offset = (page - 1) * limit;
+
+    const fetchCount = async (): Promise<number> => {
+      const countResult = await pool.query('SELECT COUNT(*) as count FROM rsvps');
+      const dbCount = parseInt(countResult.rows[0].count, 10);
+      await syncCountFromDB(async () => dbCount);
+      return dbCount;
+    };
+
+    const fetchPage = async (): Promise<RSVPPublic[]> => {
       const result = await pool.query(
-        'SELECT id, name, email, created_at FROM rsvps ORDER BY created_at DESC'
+        'SELECT id, name, email, created_at FROM rsvps ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2',
+        [limit, offset]
       );
       return result.rows as RSVPPublic[];
     };
 
-    const rsvps = await getCachedRSVPsWithLock(fetchFromDB);
-    res.json(rsvps);
+    const [data, total] = await Promise.all([
+      getCachedPageWithLock(page, limit, fetchPage),
+      getCachedCountWithLock(fetchCount),
+    ]);
+
+    const totalPages = Math.ceil(total / limit);
+
+    const response: PaginatedResponse<RSVPPublic> = {
+      data,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages,
+        hasNext: page < totalPages,
+        hasPrev: page > 1,
+      },
+    };
+
+    res.json(response);
   } catch (error) {
     console.error('Error fetching RSVPs:', error);
     res.status(500).json({ error: 'Failed to fetch RSVPs' });
@@ -138,7 +181,13 @@ export const updateRSVP = async (req: AuthRequest, res: Response): Promise<void>
       values
     );
 
-    await invalidateRSVPCache();
+    await invalidateCount();
+    await invalidateFirstPageAllLimits();
+    if (email !== undefined) {
+      const oldEmail = checkResult.rows[0].email;
+      await invalidateUserRSVP(oldEmail);
+      await setUserRSVP(email, result.rows[0]);
+    }
 
     res.json(result.rows[0]);
   } catch (error: any) {
@@ -177,9 +226,18 @@ export const deleteRSVP = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    await pool.query('DELETE FROM rsvps WHERE id = $1', [id]);
+    const email = checkResult.rows[0].email;
+    const deleteResult = await pool.query('DELETE FROM rsvps WHERE id = $1 RETURNING id', [id]);
+    
+    if (deleteResult.rowCount === 0) {
+      res.status(404).json({ error: 'RSVP not found' });
+      return;
+    }
 
-    await invalidateRSVPCache();
+    await decrementCount();
+    await invalidateCount();
+    await invalidateFirstPageAllLimits();
+    await invalidateUserRSVP(email);
 
     res.status(204).send();
   } catch (error) {
@@ -268,8 +326,13 @@ export const deleteRSVPByToken = async (req: Request, res: Response): Promise<vo
       return;
     }
 
+    const email = decoded.email;
     await pool.query('DELETE FROM rsvps WHERE id = $1', [rsvp.id]);
-    await invalidateRSVPCache();
+    
+    await decrementCount();
+    await invalidateCount();
+    await invalidateFirstPageAllLimits();
+    await invalidateUserRSVP(email);
 
     res.status(204).send();
   } catch (error) {
