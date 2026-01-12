@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import { validationResult } from 'express-validator';
 import pool from '../config/database';
 import { generateToken, isTokenExpired, verifyToken } from '../utils/jwt';
-import { getCachedRSVPs, setCachedRSVPs, invalidateRSVPCache } from '../utils/cache';
+import { getCachedRSVPsWithLock, invalidateRSVPCache } from '../utils/cache';
 import { sendCancellationEmail } from '../utils/email';
 import { sanitizeName, sanitizeEmail } from '../utils/sanitize';
 import { RSVPPublic } from '../types';
@@ -62,20 +62,14 @@ export const createRSVP = async (req: Request, res: Response): Promise<void> => 
 
 export const getAllRSVPs = async (req: Request, res: Response): Promise<void> => {
   try {
-    const cached = await getCachedRSVPs();
-    if (cached) {
-      res.json(cached);
-      return;
-    }
+    const fetchFromDB = async () => {
+      const result = await pool.query(
+        'SELECT id, name, email, created_at FROM rsvps ORDER BY created_at DESC'
+      );
+      return result.rows as RSVPPublic[];
+    };
 
-    const result = await pool.query(
-      'SELECT id, name, email, created_at FROM rsvps ORDER BY created_at DESC'
-    );
-
-    const rsvps: RSVPPublic[] = result.rows;
-
-    await setCachedRSVPs(rsvps);
-
+    const rsvps = await getCachedRSVPsWithLock(fetchFromDB);
     res.json(rsvps);
   } catch (error) {
     console.error('Error fetching RSVPs:', error);
