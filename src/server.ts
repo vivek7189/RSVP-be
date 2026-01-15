@@ -7,6 +7,8 @@ import rsvpRoutes from './routes/rsvpRoutes';
 import { errorHandler } from './middleware/errorHandler';
 import { initializeDatabase } from './config/init-db';
 import { connectRedis } from './config/redis';
+import { connectKafka } from './config/kafka';
+import { startWorkers } from './workers/startWorkers';
 
 dotenv.config();
 
@@ -65,9 +67,12 @@ const startServer = async () => {
   try {
     await initializeDatabase();
     await connectRedis();
+    await connectKafka();
+    await startWorkers();
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
+      console.log('Kafka event-driven architecture enabled');
     });
   } catch (error) {
     console.error('Failed to start server:', error);

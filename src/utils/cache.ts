@@ -173,6 +173,65 @@ export const invalidateFirstPageAllLimits = async (): Promise<void> => {
   await Promise.all(commonLimits.map(limit => invalidatePage(1, limit)));
 };
 
+export const invalidateAllPageCaches = async (): Promise<void> => {
+  try {
+    const pattern = `${CACHE_KEY_PREFIX}:attendees:page:*`;
+    let cursor = 0;
+    let deletedCount = 0;
+
+    do {
+      const result = await redisClient.scan(cursor, {
+        MATCH: pattern,
+        COUNT: 100,
+      });
+      cursor = result.cursor;
+      
+      if (result.keys.length > 0) {
+        const deleted = await redisClient.del(result.keys);
+        deletedCount += deleted;
+      }
+    } while (cursor !== 0);
+
+    if (deletedCount > 0) {
+      console.log(`Invalidated ${deletedCount} page cache keys`);
+    }
+  } catch (error) {
+    console.error('Error invalidating all page caches:', error);
+  }
+};
+
+export const calculateAffectedPages = (deletedRSVPIndex: number, limit: number): number[] => {
+  const page = Math.floor(deletedRSVPIndex / limit) + 1;
+  const totalPages = Math.ceil((deletedRSVPIndex) / limit);
+  const affectedPages: number[] = [];
+  
+  for (let p = page; p <= totalPages; p++) {
+    affectedPages.push(p);
+  }
+  
+  return affectedPages;
+};
+
+export const invalidateAffectedPages = async (
+  deletedRSVPIndex: number,
+  commonLimits: number[] = [20, 50, 100]
+): Promise<void> => {
+  try {
+    const invalidations: Promise<void>[] = [];
+    
+    for (const limit of commonLimits) {
+      const affectedPages = calculateAffectedPages(deletedRSVPIndex, limit);
+      for (const page of affectedPages) {
+        invalidations.push(invalidatePage(page, limit));
+      }
+    }
+    
+    await Promise.all(invalidations);
+  } catch (error) {
+    console.error('Error invalidating affected pages:', error);
+  }
+};
+
 export const getUserRSVP = async (email: string): Promise<any | null> => {
   try {
     const cacheKey = getUserRSVPCacheKey(email);

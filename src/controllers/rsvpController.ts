@@ -5,18 +5,14 @@ import { generateToken, isTokenExpired, verifyToken } from '../utils/jwt';
 import { 
   getCachedPageWithLock, 
   getCachedCountWithLock,
-  incrementCount,
-  decrementCount,
-  invalidateCount,
-  invalidateFirstPageAllLimits,
-  setUserRSVP,
-  invalidateUserRSVP,
   syncCountFromDB
 } from '../utils/cache';
 import { sendCancellationEmail } from '../utils/email';
 import { sanitizeName, sanitizeEmail } from '../utils/sanitize';
 import { RSVPPublic, PaginatedResponse } from '../types';
 import { AuthRequest } from '../middleware/auth';
+import { eventProducer } from '../events/producer';
+import { EventType } from '../events/types';
 
 export const createRSVP = async (req: Request, res: Response): Promise<void> => {
   const errors = validationResult(req);
@@ -49,10 +45,17 @@ export const createRSVP = async (req: Request, res: Response): Promise<void> => 
       [name, email, token, expiresAt]
     );
 
-    await incrementCount();
-    await invalidateCount();
-    await invalidateFirstPageAllLimits();
-    await setUserRSVP(email, result.rows[0]);
+    await eventProducer.publish({
+      type: EventType.RSVP_CREATED,
+      eventId: '',
+      timestamp: new Date().toISOString(),
+      data: {
+        rsvpId: result.rows[0].id,
+        email: email,
+        name: name,
+        createdAt: result.rows[0].created_at.toISOString(),
+      },
+    });
 
     sendCancellationEmail(email, name, token)
       .catch(error => {
@@ -181,13 +184,18 @@ export const updateRSVP = async (req: AuthRequest, res: Response): Promise<void>
       values
     );
 
-    await invalidateCount();
-    await invalidateFirstPageAllLimits();
-    if (email !== undefined) {
-      const oldEmail = checkResult.rows[0].email;
-      await invalidateUserRSVP(oldEmail);
-      await setUserRSVP(email, result.rows[0]);
-    }
+    await eventProducer.publish({
+      type: EventType.RSVP_UPDATED,
+      eventId: '',
+      timestamp: new Date().toISOString(),
+      data: {
+        rsvpId: parseInt(id),
+        email: email || checkResult.rows[0].email,
+        oldEmail: email !== undefined ? checkResult.rows[0].email : undefined,
+        name: name,
+        updatedAt: new Date().toISOString(),
+      },
+    });
 
     res.json(result.rows[0]);
   } catch (error: any) {
@@ -234,10 +242,16 @@ export const deleteRSVP = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    await decrementCount();
-    await invalidateCount();
-    await invalidateFirstPageAllLimits();
-    await invalidateUserRSVP(email);
+    await eventProducer.publish({
+      type: EventType.RSVP_DELETED,
+      eventId: '',
+      timestamp: new Date().toISOString(),
+      data: {
+        rsvpId: parseInt(id),
+        email: email,
+        deletedAt: new Date().toISOString(),
+      },
+    });
 
     res.status(204).send();
   } catch (error) {
@@ -329,10 +343,16 @@ export const deleteRSVPByToken = async (req: Request, res: Response): Promise<vo
     const email = decoded.email;
     await pool.query('DELETE FROM rsvps WHERE id = $1', [rsvp.id]);
     
-    await decrementCount();
-    await invalidateCount();
-    await invalidateFirstPageAllLimits();
-    await invalidateUserRSVP(email);
+    await eventProducer.publish({
+      type: EventType.RSVP_CANCELLED,
+      eventId: '',
+      timestamp: new Date().toISOString(),
+      data: {
+        rsvpId: rsvp.id,
+        email: email,
+        cancelledAt: new Date().toISOString(),
+      },
+    });
 
     res.status(204).send();
   } catch (error) {
